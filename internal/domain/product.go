@@ -5,6 +5,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/eduardocardona93/golang_shopping/pkg/apperrors"
 )
 
 // Product represents an item that can be sold (Producto).
@@ -31,4 +33,23 @@ func (p *Product) BeforeCreate(tx *gorm.DB) error {
 
 func (Product) TableName() string {
 	return "products"
+}
+
+// PriceLine prices `cantidad` units of this product with a flat `descuento`,
+// applying the product's current price and tax rate, and returns the tax
+// amount and the final subtotal for the line. It rejects a discount larger
+// than the line's gross amount.
+func (p *Product) PriceLine(cantidad int, descuento float64) (taxAmount, subtotal float64, err error) {
+	grossAmount := p.Precio * float64(cantidad)
+	if descuento > grossAmount {
+		return 0, 0, apperrors.NewValidationError([]apperrors.Field{
+			{Field: "descuento", Message: "descuento no puede ser mayor al subtotal del producto"},
+		})
+	}
+
+	taxableAmount := grossAmount - descuento
+	taxAmount = taxableAmount * (p.Impuesto / 100)
+	subtotal = taxableAmount + taxAmount
+
+	return taxAmount, subtotal, nil
 }

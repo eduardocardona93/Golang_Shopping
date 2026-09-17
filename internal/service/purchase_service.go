@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -14,9 +13,9 @@ import (
 	"github.com/eduardocardona93/golang_shopping/pkg/apperrors"
 )
 
-// PurchaseService encapsulates business logic for Purchase CRUD operations,
-// including reserving/releasing stock in Inventory as purchases are
-// created, updated or deleted.
+// PurchaseService encapsulates the orchestration of Purchase CRUD
+// operations: fetching and locking the rows involved, delegating pricing,
+// stock and totals rules to the domain layer, and persisting the result.
 type PurchaseService interface {
 	Create(ctx context.Context, req dto.CreatePurchaseRequest) (*domain.Purchase, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Purchase, error)
@@ -52,42 +51,25 @@ func NewPurchaseService(
 	}
 }
 
-// lineTotals holds the computed monetary breakdown for a purchase's items.
-type lineTotals struct {
-	items         []domain.PurchaseItem
-	totalImpuesto float64
-	totalItems    float64 // sum of item subtotals (already includes tax and item discounts)
-}
-
 func (s *purchaseService) Create(ctx context.Context, req dto.CreatePurchaseRequest) (*domain.Purchase, error) {
 	if _, err := s.users.GetByID(ctx, req.UserID); err != nil {
 		return nil, err
 	}
 
-	var purchase domain.Purchase
+	var purchase *domain.Purchase
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		totals, err := s.reserveStockAndBuildItems(ctx, tx, req.Items)
+		items, err := s.reserveStockAndPriceItems(ctx, tx, req.Items)
 		if err != nil {
 			return err
 		}
 
-		if req.DescuentoFinal > totals.totalItems {
-			return apperrors.NewValidationError([]apperrors.Field{
-				{Field: "descuento_final", Message: "descuento_final no puede ser mayor al total de la compra"},
-			})
+		purchase, err = domain.NewPurchase(req.UserID, items, req.DescuentoFinal)
+		if err != nil {
+			return err
 		}
 
-		purchase = domain.Purchase{
-			UserID:         req.UserID,
-			Items:          totals.items,
-			Fecha:          time.Now(),
-			Impuesto:       totals.totalImpuesto,
-			DescuentoFinal: req.DescuentoFinal,
-			Total:          totals.totalItems - req.DescuentoFinal,
-		}
-
-		return s.purchases.WithTx(tx).Create(ctx, &purchase)
+		return s.purchases.WithTx(tx).Create(ctx, purchase)
 	})
 	if err != nil {
 		return nil, err
@@ -96,16 +78,16 @@ func (s *purchaseService) Create(ctx context.Context, req dto.CreatePurchaseRequ
 	return s.purchases.GetByID(ctx, purchase.ID)
 }
 
-// reserveStockAndBuildItems validates and locks inventory for every
-// requested line item, decrements available stock and returns the
-// fully-priced PurchaseItem records plus aggregate totals. It must run
-// inside an active transaction (tx) so that the row locks and stock
-// decrements are atomic with the rest of the purchase write.
-func (s *purchaseService) reserveStockAndBuildItems(ctx context.Context, tx *gorm.DB, itemReqs []dto.PurchaseItemRequest) (*lineTotals, error) {
+// reserveStockAndPriceItems locks the Inventory row for every requested
+// line item, delegates the stock reservation and pricing to the domain
+// layer, and persists the resulting quantities. It must run inside an
+// active transaction (tx) so that the row locks and stock decrements are
+// atomic with the rest of the purchase write.
+func (s *purchaseService) reserveStockAndPriceItems(ctx context.Context, tx *gorm.DB, itemReqs []dto.PurchaseItemRequest) ([]domain.PurchaseItem, error) {
 	products := s.products.WithTx(tx)
 	inventories := s.inventories.WithTx(tx)
 
-	totals := &lineTotals{items: make([]domain.PurchaseItem, 0, len(itemReqs))}
+	items := make([]domain.PurchaseItem, 0, len(itemReqs))
 
 	for _, itemReq := range itemReqs {
 		product, err := products.GetByID(ctx, itemReq.ProductID)
@@ -120,38 +102,22 @@ func (s *purchaseService) reserveStockAndBuildItems(ctx context.Context, tx *gor
 			return nil, err
 		}
 
-		if inventory.Cantidad < itemReq.Cantidad {
-			return nil, apperrors.NewInsufficientStockError(product.ID.String(), itemReq.Cantidad, inventory.Cantidad)
+		if err := inventory.Reserve(itemReq.Cantidad); err != nil {
+			return nil, err
 		}
 
-		grossAmount := product.Precio * float64(itemReq.Cantidad)
-		if itemReq.Descuento > grossAmount {
-			return nil, apperrors.NewValidationError([]apperrors.Field{
-				{Field: "descuento", Message: "descuento no puede ser mayor al subtotal del producto"},
-			})
+		item, err := domain.NewPurchaseItem(product, itemReq.Cantidad, itemReq.Descuento)
+		if err != nil {
+			return nil, err
 		}
+		items = append(items, item)
 
-		taxableAmount := grossAmount - itemReq.Descuento
-		taxAmount := taxableAmount * (product.Impuesto / 100)
-		subtotal := taxableAmount + taxAmount
-
-		totals.items = append(totals.items, domain.PurchaseItem{
-			ProductID:   product.ID,
-			Cantidad:    itemReq.Cantidad,
-			PrecioVenta: product.Precio,
-			Descuento:   itemReq.Descuento,
-			Impuesto:    product.Impuesto,
-			Subtotal:    subtotal,
-		})
-		totals.totalImpuesto += taxAmount
-		totals.totalItems += subtotal
-
-		if err := inventories.UpdateQuantity(ctx, inventory.ID, inventory.Cantidad-itemReq.Cantidad); err != nil {
+		if err := inventories.UpdateQuantity(ctx, inventory.ID, inventory.Cantidad); err != nil {
 			return nil, err
 		}
 	}
 
-	return totals, nil
+	return items, nil
 }
 
 // releaseStock restores previously reserved inventory quantities, used when
@@ -171,7 +137,9 @@ func (s *purchaseService) releaseStock(ctx context.Context, tx *gorm.DB, items [
 			return err
 		}
 
-		if err := inventories.UpdateQuantity(ctx, inventory.ID, inventory.Cantidad+item.Cantidad); err != nil {
+		inventory.Release(item.Cantidad)
+
+		if err := inventories.UpdateQuantity(ctx, inventory.ID, inventory.Cantidad); err != nil {
 			return err
 		}
 	}
@@ -198,25 +166,19 @@ func (s *purchaseService) Update(ctx context.Context, id uuid.UUID, req dto.Upda
 			return err
 		}
 
-		totals, err := s.reserveStockAndBuildItems(ctx, tx, req.Items)
+		items, err := s.reserveStockAndPriceItems(ctx, tx, req.Items)
 		if err != nil {
 			return err
 		}
 
-		if req.DescuentoFinal > totals.totalItems {
-			return apperrors.NewValidationError([]apperrors.Field{
-				{Field: "descuento_final", Message: "descuento_final no puede ser mayor al total de la compra"},
-			})
-		}
-
-		if err := s.purchases.WithTx(tx).ReplaceItems(ctx, id, totals.items); err != nil {
+		if err := existing.ApplyItems(items, req.DescuentoFinal); err != nil {
 			return err
 		}
-
 		existing.Fecha = req.Fecha
-		existing.Impuesto = totals.totalImpuesto
-		existing.DescuentoFinal = req.DescuentoFinal
-		existing.Total = totals.totalItems - req.DescuentoFinal
+
+		if err := s.purchases.WithTx(tx).ReplaceItems(ctx, id, existing.Items); err != nil {
+			return err
+		}
 
 		return s.purchases.WithTx(tx).UpdateHeader(ctx, existing)
 	})

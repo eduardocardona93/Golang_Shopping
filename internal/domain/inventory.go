@@ -5,6 +5,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/eduardocardona93/golang_shopping/pkg/apperrors"
 )
 
 // Inventory tracks stock levels for a Product (Inventario).
@@ -29,4 +31,23 @@ func (i *Inventory) BeforeCreate(tx *gorm.DB) error {
 
 func (Inventory) TableName() string {
 	return "inventories"
+}
+
+// Reserve decrements the available quantity by qty, rejecting the
+// reservation with apperrors.ErrInsufficientStock if there isn't enough
+// stock. Callers are expected to have loaded the Inventory with a row lock
+// (see repository.InventoryRepository.GetByProductIDForUpdate) and to
+// persist the updated Cantidad afterward.
+func (i *Inventory) Reserve(qty int) error {
+	if i.Cantidad < qty {
+		return apperrors.NewInsufficientStockError(i.ProductID.String(), qty, i.Cantidad)
+	}
+	i.Cantidad -= qty
+	return nil
+}
+
+// Release restores qty units back to the available quantity, undoing a
+// previous Reserve (e.g. when a purchase is updated or deleted).
+func (i *Inventory) Release(qty int) {
+	i.Cantidad += qty
 }

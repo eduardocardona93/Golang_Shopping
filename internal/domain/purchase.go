@@ -5,6 +5,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/eduardocardona93/golang_shopping/pkg/apperrors"
 )
 
 // Purchase represents a sale transaction (Compra) composed of multiple PurchaseItems.
@@ -35,6 +37,40 @@ func (Purchase) TableName() string {
 	return "purchases"
 }
 
+// NewPurchase assembles a Purchase for userID from its already-priced items,
+// computing the aggregate tax and total and applying descuentoFinal. It
+// rejects a final discount larger than the items' total.
+func NewPurchase(userID uuid.UUID, items []PurchaseItem, descuentoFinal float64) (*Purchase, error) {
+	p := &Purchase{UserID: userID, Fecha: time.Now()}
+	if err := p.ApplyItems(items, descuentoFinal); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// ApplyItems replaces the purchase's items and recomputes its aggregate tax,
+// final discount and total from them. It rejects a final discount larger
+// than the items' total, leaving the purchase unchanged on error.
+func (p *Purchase) ApplyItems(items []PurchaseItem, descuentoFinal float64) error {
+	var totalItems, totalImpuesto float64
+	for _, item := range items {
+		totalItems += item.Subtotal
+		totalImpuesto += item.TaxAmount()
+	}
+
+	if descuentoFinal > totalItems {
+		return apperrors.NewValidationError([]apperrors.Field{
+			{Field: "descuento_final", Message: "descuento_final no puede ser mayor al total de la compra"},
+		})
+	}
+
+	p.Items = items
+	p.Impuesto = totalImpuesto
+	p.DescuentoFinal = descuentoFinal
+	p.Total = totalItems - descuentoFinal
+	return nil
+}
+
 // PurchaseItem represents a line item within a Purchase (ListaProducto).
 type PurchaseItem struct {
 	ID         uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
@@ -63,4 +99,29 @@ func (i *PurchaseItem) BeforeCreate(tx *gorm.DB) error {
 
 func (PurchaseItem) TableName() string {
 	return "purchase_items"
+}
+
+// NewPurchaseItem prices a line item for product, snapshotting its current
+// unit price and tax rate so the line stays accurate even if the product is
+// changed later.
+func NewPurchaseItem(product *Product, cantidad int, descuento float64) (PurchaseItem, error) {
+	_, subtotal, err := product.PriceLine(cantidad, descuento)
+	if err != nil {
+		return PurchaseItem{}, err
+	}
+
+	return PurchaseItem{
+		ProductID:   product.ID,
+		Cantidad:    cantidad,
+		PrecioVenta: product.Precio,
+		Descuento:   descuento,
+		Impuesto:    product.Impuesto,
+		Subtotal:    subtotal,
+	}, nil
+}
+
+// TaxAmount returns the monetary tax included in this line's Subtotal.
+func (i PurchaseItem) TaxAmount() float64 {
+	taxableAmount := i.PrecioVenta*float64(i.Cantidad) - i.Descuento
+	return i.Subtotal - taxableAmount
 }
